@@ -1,0 +1,643 @@
+---
+title: "mousedatacleaning"
+output: html_document
+date: "2025-01-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+getwd()
+```
+```{r packages + lilbararies}
+# Install pacman 
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman")
+}
+
+# load packages
+pacman::p_load(readxl, openxlsx, future, furrr, dplyr, tidyr)
+```
+
+# loading in the data and splitting into relevant chunks 
+# we are working with a k-limbic file, which has some metadata at the beginning, trial data and some coded metadata. we will just use the trial
+# data here, which is stored in references list. 
+# adittionally, every file is one day, which contains multiple mice trials for that day
+# in this code, i pretend all the days are one long trial for each mouse
+# I also transform the punishments to be useful to my purposes, but feel free to change that 
+# keep in mind the deck numbers have been switched on the mice, reference the excel document given by the Finnish researchers, 
+# the code fixes this, but be aware of this when trying to debug.
+# have fun!
+
+```{r run this instead - load in these files into two lists instead}
+
+
+library(readr)
+
+# path
+# folder_path <-  "/work/mousedata"
+
+folder_path <-"/work/desccionmaking/mousedata"
+
+# find all files
+files <- list.files(folder_path, pattern = "\\.xlsx\\.rds$", full.names = TRUE)
+
+# Separate files into references and datasets (named when I was confused, datasets are codes where all the activity is stored)
+references_files <- files[grep("references_", files)]
+datasets_files <- files[grep("datasets_", files)]
+
+# Extract day
+extract_pattern <- function(file_name) {
+  pattern <- sub(".*_(\\d+_\\d+).*", "\\1", file_name)
+  return(pattern)
+}
+
+# Sort files based on day
+references_files <- references_files[order(sapply(references_files, extract_pattern))]
+datasets_files <- datasets_files[order(sapply(datasets_files, extract_pattern))]
+
+# Load the files into lists
+references <- lapply(references_files, readRDS)
+datasets <- lapply(datasets_files, readRDS)
+
+# Names each index in the list based on the day of recording 
+names(references) <- basename(references_files)
+names(datasets) <- basename(datasets_files)
+
+```
+
+# finds id and cuts off so we only have choices 
+```{r finds subject id}
+library(data.table)
+
+# store Subject Id 
+subject_id_list <- list()
+
+# Loop over the list of references
+
+for (ref_name in names(references)) {
+  day_references <- references[[ref_name]]
+  
+  # Loop over each experiment within the day
+  for (j in seq_along(day_references)) {
+    reference <- as.data.table(day_references[[j]])
+    
+    # Print the current reference
+    #print(j)
+    
+    # Find the row where any column contains "Subject Id"
+    subject_id_row <- which(reference == "Subject Id", arr.ind = TRUE)[, 1]
+    
+    # If the 'Subject Id' is found, extract the associated value from the next column
+    if (length(subject_id_row) > 0) {
+      subject_id_value <- reference[subject_id_row, which(reference[subject_id_row, ] == "Subject Id") + 1, with = FALSE]
+      #print(subject_id_value)  # Preview the extracted value
+      
+      # Store the Subject Id value in the list with the index as the key
+      subject_id_list[[ref_name]] <- c(subject_id_list[[ref_name]], subject_id_value)
+    } else {
+      print("NA")
+    }
+    
+    # Save the updated reference back to the list
+    day_references[[j]] <- reference
+  }
+  
+  # saves the updated day references back to the main list
+  references[[ref_name]] <- day_references
+}
+
+# Outputs the list of references and Subject Ids
+#print(references)
+#print(subject_id_list)
+```
+
+```{r cutting off the dataframes when we reach the Ref  in STARTDATA col since we got id}
+# Loops through each index in references
+for (j in 1:length(references)) {
+  # loops through each dataframe in the current index
+  for (k in 1:length(references[[j]])) {
+    # extracts the current dataframe from the index
+    df1 <- references[[j]][[k]]
+    
+    # Checks if 'STARTDATA' column  (col 1) exists in the dataframe
+    if ("STARTDATA" %in% colnames(df1)) {
+      # Find the position of the first occurrence of 'Ref' in STARTDATA
+      trial_start_row <- which(df1$STARTDATA == "Ref")[1]
+      
+      # checks if there is a 'Ref'
+      if (!is.na(trial_start_row)) {
+        # snips everything off starting from ref
+        df1 <- df1[trial_start_row:nrow(df1), ]
+        
+        # updates df 
+        references[[j]][[k]] <- df1
+      } else {
+        cat("no ref in df ", k, " in sublist ", j, ". Skipping.\n")
+      }
+    } else {
+      cat("miv no startdata col", k, " in sublist ", j, ". Skipping.\n")
+    }
+  }
+}
+
+
+
+```
+```{r taking out the time collumn from the original data}
+library(data.table)
+
+extract_column_data <- function(nested_list) {
+  lapply(nested_list, function(inner_list) {
+    if (!is.list(inner_list)) return(NULL) 
+    
+    lapply(inner_list, function(dt) {
+      if (!inherits(dt, "data.table")) return(NULL)  #there are a lot of checks here because it kept throwing errors, idk why but this helps
+      
+      # finds column "...5"
+      col_name <- grep("\\.\\.\\.5$", names(dt), value = TRUE) 
+      
+      if (length(col_name) == 1) {
+        return(dt[[col_name]][-1])  # excludes the first row
+      } else {
+        return(NULL)  # if its not there, skip
+      }
+    })
+  })
+}
+
+time_list <- extract_column_data(references)
+
+
+
+```
+
+```{r getting the time per turn}
+time_list <- lapply(time_list, function(inner_list) {
+  lapply(inner_list, function(vec) {
+    if (!is.null(vec) && length(vec) > 1) {
+      return(diff(as.numeric(vec)))  # this is quite nice bc the time is in one col.. sometimes we are lucky
+    } else {
+      return(NULL)  # when one trial ends, the next starts immediately after, which allows us to do this
+    }
+  })
+})
+
+```
+
+
+```{r deck choices and removing last row if any NA}
+# Moves everything into a new list where we record the deck selections
+results_list <- setNames(vector("list", length(references)), names(references))
+
+# go through all ref
+for (ref_name in names(references)) {
+  # get names
+  ref_dataframes <- references[[ref_name]]
+  
+  # list
+  results_list[[ref_name]] <- vector("list", length(ref_dataframes))
+  
+  # go through all the df found
+  for (df_index in seq_along(ref_dataframes)) {
+    # take one
+    df <- ref_dataframes[[df_index]]
+    
+    # for some reason nessecary, also doing this in data table instead of data frame for speed 
+    df <- as.data.table(df)
+    
+    # remove last row if na, sometimes this one is recorded, but doesnt contain any data, so out it goes 
+    if (any(is.na(df[nrow(df), ]))) {
+      df <- df[-.N]  
+    }
+
+    # making a new place to store deck choice
+    results_df <- data.table(deck = rep(0, nrow(df)))
+
+    # finds the deck choice per trial
+    for (row_index in seq(2, nrow(df))) {
+      if (!is.na(df[row_index, "...32", with = FALSE][[1]]) && df[row_index, "...32", with = FALSE][[1]] != 0) {
+        results_df$deck[row_index] <- 1
+      } else if (!is.na(df[row_index, "...33", with = FALSE][[1]]) && df[row_index, "...33", with = FALSE][[1]] != 0) {
+        results_df$deck[row_index] <- 2
+      } else if (!is.na(df[row_index, "...34", with = FALSE][[1]]) && df[row_index, "...34", with = FALSE][[1]] != 0) {
+        results_df$deck[row_index] <- 3
+      } else if (!is.na(df[row_index, "...35", with = FALSE][[1]]) && df[row_index, "...35", with = FALSE][[1]] != 0) {
+        results_df$deck[row_index] <- 4
+      } else {
+        results_df$deck[row_index] <- 0  # Default to 0 if no nonzero value is found
+      }
+    }
+    
+    # removes the first row of the deck collumn, since it has words instead of data (forgot to cut this off earlier)
+    results_df <- results_df[-1, ]  
+    
+    # Store
+    results_list[[ref_name]][[df_index]] <- results_df
+    
+    # Save 
+    references[[ref_name]][[df_index]] <- df
+  }
+}
+
+```
+
+
+```{r mergning the two lists} 
+# adds time, keeps date as name for index
+results_list <- setNames(lapply(names(results_list), function(i) {
+  setNames(lapply(seq_along(results_list[[i]]), function(j) {
+    results_list[[i]][[j]][, Time := time_list[[i]][[j]]]
+  }), names(results_list[[i]]))  
+}), names(results_list)) 
+```
+
+
+
+# return to here to add id when we are done selecting the selected decks 
+
+```{r looping over multiple dataframes and adding ID}
+
+# Check if lengths of results_list and subject_id_list match
+if (length(results_list) != length(subject_id_list)) {
+  stop("nope")
+}
+
+#adds id to all of the mice
+for (ref_index in seq_along(results_list)) {
+  # Iterate through each data.table within the current reference
+  for (df_index in seq_along(results_list[[ref_index]])) {
+    # Get the current data.table from results_list
+    dt <- results_list[[ref_index]][[df_index]]
+    
+    #check
+    setDT(dt)
+    
+    # gets id 
+    subject_id <- subject_id_list[[ref_index]][[df_index]]
+    
+    # add it onto our deck choice dfs
+    dt[, ID := subject_id]
+    
+    # i like it to be the first col
+    setcolorder(dt, c("ID", setdiff(names(dt), "ID")))
+    
+    # save
+    results_list[[ref_index]][[df_index]] <- dt
+  }
+}
+
+```
+
+
+# adding if they got a reward or not 
+
+```{r recording reward and adding to results}
+
+
+for (j in 1:length(references)) {
+  for (k in 1:length(references[[j]])) {
+    df1 <- references[[j]][[k]]
+    
+    df2 <- results_list[[j]][[k]]
+    
+    setDT(df2)
+  
+    # prepare reward 
+    if (!"reward" %in% names(df2)) {
+      df2[, reward := 0]
+    }
+    
+    # Loop through each row starting from the 2nd row in df1
+    for (i in 2:nrow(df1)) {  # Start loop from row 2 (second row) in df1
+      # checks the columns 45 to 48 and converts  to numeric, NA=0
+      cols <- as.numeric(c(df1[i, "...45", with = FALSE], df1[i, "...46", with = FALSE], 
+                           df1[i, "...47", with = FALSE], df1[i, "...48", with = FALSE]))
+      cols[is.na(cols)] <- 0  # Convert NA to 0
+      
+      # Findsw non-zero values 
+      non_zero_values <- cols[cols %in% c(1, 2, 3, 4)]
+      
+      # If any add to df 
+      if (length(non_zero_values) > 0) {
+        df2[i - 1, reward := non_zero_values[1]]  
+      } else {
+        df2[i - 1, reward := 0]  # 0 if none found
+      }
+    }
+    
+    # save
+    results_list[[j]][[k]] <- df2
+  }
+}
+
+
+```
+
+```{r changing the deck selections given the knowledge about participant id}
+
+
+for (i in seq_along(results_list)) {
+ 
+  for (j in seq_along(results_list[[i]])) {
+  
+    dt <- results_list[[i]][[j]]
+    
+    setDT(dt)
+    dt[, ID := as.numeric(ID)]
+    
+    # is ID is odd or even
+    if (dt$ID[1] %% 2 == 1) {
+      # odd ids
+      dt[, deck := case_when(
+        deck == 1 ~ 1,  # 1 becomes 1
+        deck == 2 ~ 4,  # 2 becomes 4
+        deck == 3 ~ 2,  # 3 becomes 2
+        deck == 4 ~ 3   # 4 becomes 3
+      )]
+    } else {
+      # even ids
+      dt[, deck := case_when(
+        deck == 1 ~ 4,  # 1 becomes 4
+        deck == 2 ~ 1,  # 2 becomes 1
+        deck == 3 ~ 3,  # 3 becomes 3
+        deck == 4 ~ 2   # 4 becomes 2
+      )]
+    }
+    
+    # save
+    results_list[[i]][[j]] <- dt
+  }
+}
+
+
+```
+
+```{r removing rows wher the mice did not choose anything}
+
+for (i in seq_along(results_list)) {
+  
+  for (j in seq_along(results_list[[i]])) {
+   
+    dt <- results_list[[i]][[j]]
+    
+    setDT(dt)
+    
+    # removes when mice blanked a run - this might be nice to keep if doing more complex stuff
+    dt <- dt[!is.na(deck)]
+    
+    # save
+    results_list[[i]][[j]] <- dt
+  }
+}
+
+
+```
+
+
+```{r adding in the trial number}
+
+# Iterate over each list in results_list
+for (i in seq_along(results_list)) {
+ 
+  for (j in seq_along(results_list[[i]])) {
+    
+    setDT(results_list[[i]][[j]])
+    
+    # adds a trial, aka choice number
+    results_list[[i]][[j]][, trial := .I]
+  }
+}
+
+```
+
+
+```{r find the dates from the index}
+dates_index <- sapply(names(results_list), function(name) {
+  # get date of run
+  sub(".*_(\\d{1,2}_\\d{1,2})\\.xlsx\\.rds", "\\1", name)
+})
+```
+
+```{r get date}
+# add the date column
+for (i in seq_along(results_list)) {
+
+  current_date <- dates_index[i]
+  
+  for (j in seq_along(results_list[[i]])) {
+    results_list[[i]][[j]]$date <- current_date
+  }
+}
+```
+
+```{r getting reward per second 🔥}
+total_reward_all <- 0
+total_time_all <- 0
+
+for (i in seq_along(results_list)) {
+  
+  for (dt in results_list[[i]]) {
+    
+    dt$Time <- as.numeric(as.character(dt$Time))
+    dt$reward <- as.numeric(as.character(dt$reward))
+    
+    # NA is 0
+    dt$Time[is.na(dt$Time)] <- 0
+    dt$reward[is.na(dt$reward)] <- 0
+    
+    # only get reward rows
+    dt <- dt[dt$reward %in% c(1, 2, 3, 4), ]
+    
+    # removes time 0 
+    dt <- dt[dt$Time > 0, ]
+    
+    # adds all reward and time up
+    total_reward_all <- total_reward_all + sum(dt$reward, na.rm = TRUE)
+    total_time_all <- total_time_all + sum(dt$Time, na.rm = TRUE) / 100  # Convert centiseconds to seconds
+  }
+}
+
+# average reward per second
+overall_avg_reward_per_second <- total_reward_all / total_time_all
+
+```
+```{r adding a punishment collumn}
+# different punishments on the decks, so need to multiply to get the right ones
+punishment_multipliers <- c("1" = 5, "2" = 10, "3" = 30, "4" = 40)
+
+# same same, looking back some of these loops could have been merged rip
+for (i in seq_along(results_list)) {
+  
+  for (j in seq_along(results_list[[i]])) {
+    dt <- results_list[[i]][[j]]
+    
+    dt$deck <- suppressWarnings(as.numeric(dt$deck))
+    dt$reward <- suppressWarnings(as.numeric(dt$reward))
+    
+    dt$punishments <- 0
+    
+    #finds punishment rows
+    zero_reward_rows <- dt$reward == 0 & !is.na(dt$deck)
+    
+    # get the punishment based on the deck choices
+    dt$punishments[zero_reward_rows] <- -overall_avg_reward_per_second * punishment_multipliers[as.character(dt$deck[zero_reward_rows])]
+    
+    # save
+    results_list[[i]][[j]] <- dt
+  }
+}
+
+```
+
+```{r collect all datatables again}
+
+all_data_tables <- list()
+
+#this collapses the nested structure to begin to merge the mice, so each mouse has all their trials together
+
+for (i in seq_along(results_list)) {
+  
+  if (is.list(results_list[[i]])) {
+    all_data_tables <- c(all_data_tables, results_list[[i]])
+  } else {
+    all_data_tables <- c(all_data_tables, list(results_list[[i]]))
+  }
+}
+
+```
+
+
+```{r new list, same mice on same index}
+
+same_mouse <- list()
+
+#finds id 
+first_row_ids <- sapply(all_data_tables, function(df) df$ID[1])
+
+unique_ids <- unique(first_row_ids)
+
+# group by id
+for (id in unique_ids) {
+
+  matching_tables <- which(first_row_ids == id)
+  
+  # save 
+  same_mouse[[as.character(id)]] <- all_data_tables[matching_tables]
+}
+
+```
+
+```{r merging the same mouse into one dataframe}
+merged_list <- lapply(same_mouse, bind_rows)
+
+```
+
+```{r mergning dataframes into one}
+individual_mouse_dataframes <- lapply(merged_list, as.data.frame)
+
+```
+
+```{r in between to get date and month into two cols}
+
+# split the date column
+split_date_column <- function(df) {
+  df <- df %>%
+    mutate(
+      day = as.numeric(sub("_.*", "", df[["date"]])),  #day
+      month = as.numeric(sub(".*_", "", df[["date"]])) # month
+    )
+  return(df)
+}
+
+individual_mouse_dataframes <- lapply(individual_mouse_dataframes, split_date_column)
+
+
+```
+
+```{r sorting to get one long trial count instead of per sessison}
+
+create_choice_column <- function(df, df_name) {
+  
+  #one df is empty so just skip, 
+  if (is.null(df) || nrow(df) == 0) {
+    warning(paste("Warning: Dataframe", df_name, "is NULL or empty. Skipping."))
+    return(df) 
+  }
+  
+  # Sorting by month, day, and trial
+  df <- df %>%
+    arrange(month, day, trial) %>%
+    mutate(choice = row_number())  # generates row numbers in order of day
+  
+  return(df)
+}
+
+
+individual_mouse_dataframes <- lapply(names(individual_mouse_dataframes), function(df_name) {
+ 
+  if (!is.null(individual_mouse_dataframes[[df_name]])) {
+    individual_mouse_dataframes[[df_name]] <- create_choice_column(individual_mouse_dataframes[[df_name]], df_name)
+  }
+  return(individual_mouse_dataframes[[df_name]])
+})
+
+```
+
+```{r renaming cols to match with the one used in class script}
+# clean and merge 
+process_and_merge <- function(df_list) {
+  # remove empty df
+  df_list <- Filter(function(df) is.data.frame(df) && nrow(df) > 0, df_list)
+  
+  if (length(df_list) == 0) {
+    print("NOPE")
+    return(NULL)
+  }
+
+  merged_df <- do.call(rbind, lapply(df_list, function(df) {
+    
+    df <- df[, c("ID", "deck", "reward", "punishments", "choice"), drop = FALSE]
+    
+    #rename cols
+    colnames(df) <- c("subjID", "deck", "gain", "loss", "trial")
+    
+    return(df)
+  }))
+  
+  return(merged_df)
+}
+
+
+# merge dfs
+IGT_sober_mouse <- process_and_merge(individual_mouse_dataframes)
+
+
+```
+
+
+```{r cutting down so equal numnber of trials per id}
+# find minimum number of trials per id
+# Ensure all IDs have exactly 100 trials
+IGT_sober_mouse <- IGT_sober_mouse %>%
+  group_by(subjID) %>%
+  slice_head(n = 100) %>%  #keep first 100 rows per ID
+  ungroup()
+
+
+```
+
+```{r save as txt}
+
+save_merged_txt <- function(df, filename) {
+    write.table(df, file = filename, sep = "\t", row.names = FALSE, quote = TRUE)
+}
+
+
+# Save as one TXT file
+save_merged_txt(IGT_sober_mouse, "IGT_sober_mouse.txt")
+```
+
+
